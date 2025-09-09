@@ -55,8 +55,8 @@ import csv
 import json
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -73,12 +73,6 @@ class BeadType:
     epsilon_kj_mol: float
     sigma_nm: float
     mass_amu: float
-    # Optional pH-dependent properties
-    # titration_sites: list of sites with pKa and charges in prot/deprot states
-    # Example site: {"pka": 2.8, "type": "base", "charge_protonated": 1.0, "charge_deprotonated": 0.0}
-    titration_sites: Optional[List[Dict[str, float]]] = field(default=None)
-    # Map of pH(string) -> relative solubility factor (0..1); used to scale cohesion
-    solubility_ph_curve: Optional[Dict[str, float]] = field(default=None)
 
 
 @dataclass
@@ -126,91 +120,12 @@ def get_default_bead_library() -> Dict[str, BeadType]:
 def resolve_bead_type(name: str, overrides: Dict[str, float]) -> BeadType:
     lib = get_default_bead_library()
     base = lib.get(name, lib["generic"])
-    bead = BeadType(
+    return BeadType(
         name=name,
         epsilon_kj_mol=float(overrides.get("epsilon_kj_mol", base.epsilon_kj_mol)),
         sigma_nm=float(overrides.get("sigma_nm", base.sigma_nm)),
         mass_amu=float(overrides.get("mass_amu", base.mass_amu)),
     )
-    # Optional pH fields (if provided in overrides)
-    if isinstance(overrides.get("titration_sites"), list):
-        bead.titration_sites = overrides.get("titration_sites")
-    if isinstance(overrides.get("solubility_ph_curve"), dict):
-        # Normalize keys to strings
-        bead.solubility_ph_curve = {str(k): float(v) for k, v in overrides.get("solubility_ph_curve").items()}
-    return bead
-
-
-# ------------------------------ pH & Solubility Helpers ----------------------
-
-
-def henderson_hasselbalch_fraction_protonated(pH: float, pKa: float, site_type: str) -> float:
-    """Return fraction of protonated form for a site.
-
-    site_type: 'acid' or 'base'
-    For acids: HA <-> H+ + A-, fraction protonated = 1/(1+10^(pH-pKa))
-    For bases: BH+ <-> B + H+, fraction protonated = 1/(1+10^(pH-pKa)) as well
-    """
-    return 1.0 / (1.0 + 10.0 ** (pH - pKa))
-
-
-def compute_effective_charge_e(bead: BeadType, pH: float) -> float:
-    if not bead.titration_sites:
-        return 0.0
-    total_charge = 0.0
-    for site in bead.titration_sites:
-        pka = float(site.get("pka"))
-        site_type = str(site.get("type", "base")).lower()
-        qH = float(site.get("charge_protonated", 0.0))
-        q = float(site.get("charge_deprotonated", 0.0))
-        fH = henderson_hasselbalch_fraction_protonated(pH, pka, site_type)
-        total_charge += fH * qH + (1.0 - fH) * q
-    return total_charge
-
-
-def interpolate_solubility_factor(bead: BeadType, pH: float) -> float:
-    """Interpolate relative solubility factor (0..1) from the bead's curve at given pH.
-    Defaults to 0.0 if no curve (no scaling), bounded to [0, 1].
-    """
-    if not bead.solubility_ph_curve:
-        return 0.0
-    # Convert keys to floats
-    items = sorted([(float(k), float(v)) for k, v in bead.solubility_ph_curve.items()], key=lambda x: x[0])
-    ph_vals = [x[0] for x in items]
-    s_vals = [x[1] for x in items]
-    if pH <= ph_vals[0]:
-        return max(0.0, min(1.0, s_vals[0]))
-    if pH >= ph_vals[-1]:
-        return max(0.0, min(1.0, s_vals[-1]))
-    # Linear interpolation
-    for i in range(1, len(ph_vals)):
-        if pH <= ph_vals[i]:
-            p0, s0 = ph_vals[i - 1], s_vals[i - 1]
-            p1, s1 = ph_vals[i], s_vals[i]
-            t = (pH - p0) / (p1 - p0)
-            s = s0 * (1 - t) + s1 * t
-            return max(0.0, min(1.0, s))
-    return 0.0
-
-
-def estimate_debye_length_nm(ionic_strength_mM: float, temperature_K: float) -> float:
-    """Approximate Debye length in nm at given ionic strength (monovalent) and temperature.
-
-    Empirical: lambda_D(nm) ~ 0.304 / sqrt(I[M]) * sqrt(298K / T)
-    """
-    I_M = max(1e-9, ionic_strength_mM * 1e-3)
-    base = 0.304 / math.sqrt(I_M)
-    temp_scale = math.sqrt(298.0 / max(200.0, temperature_K))
-    return base * temp_scale
-
-
-def charge_screening_factor(ionic_strength_mM: float, temperature_K: float) -> float:
-    """Return a [0,1] scaling factor for charges to mimic ionic screening.
-    More salt -> shorter Debye length -> stronger screening (smaller factor).
-    """
-    lam_nm = estimate_debye_length_nm(ionic_strength_mM, temperature_K)
-    # Map Debye length to a simple scaling: larger lambda -> closer to 1
-    return max(0.2, min(1.0, lam_nm / (lam_nm + 1.0)))
 
 
 # ------------------------------ Geometry Helpers -----------------------------
@@ -310,9 +225,6 @@ def build_system(
     cutoff_nm: float,
     use_pbc: bool,
     box_size_nm: float,
-    solution_pH: float,
-    ionic_strength_mM: float,
-    temperature_K: float,
 ) -> Tuple[openmm.System, openmm.NonbondedForce]:
     system = openmm.System()
 
@@ -329,22 +241,14 @@ def build_system(
     for comp in components:
         particle_types.extend([comp.bead_type] * comp.count)
 
-    # Precompute screening and per-type scaling
-    q_screen = charge_screening_factor(ionic_strength_mM, temperature_K)
-
     for bead in particle_types:
         mass = bead.mass_amu * unit.amu
-        system.addParticle(mass)
-        # Compute pH-dependent charge and solubility-based cohesion scaling
-        q_e = compute_effective_charge_e(bead, solution_pH) * q_screen
-        sol_factor = interpolate_solubility_factor(bead, solution_pH)
-        # Reduce cohesion (epsilon) as solubility increases; keep a floor to avoid collapse
-        epsilon_scale = 1.0 - 0.6 * max(0.0, min(1.0, sol_factor))
-        epsilon_eff = max(0.2, epsilon_scale) * bead.epsilon_kj_mol
+        idx = system.addParticle(mass)
+        # Charge 0, LJ sigma/epsilon
         nb.addParticle(
-            q_e * unit.elementary_charge,
+            0.0 * unit.elementary_charge,
             bead.sigma_nm * unit.nanometer,
-            epsilon_eff * unit.kilojoule_per_mole,
+            bead.epsilon_kj_mol * unit.kilojoule_per_mole,
         )
 
     if use_pbc:
@@ -401,8 +305,6 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
     simulation_time_ps = float(cfg.get("simulation_time_ps", 2000.0))
     box_nm = float(cfg.get("box_nm", 12.0))
     random_seed = int(cfg.get("random_seed", 2025))
-    solution_pH = float(cfg.get("solution_ph", 6.8))
-    ionic_strength_mM = float(cfg.get("ionic_strength_mM", 100.0))
 
     steps = (
         int(override_steps)
@@ -447,15 +349,7 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
 
     # Build system
     cutoff_nm = 1.2
-    system, nb = build_system(
-        components,
-        cutoff_nm=cutoff_nm,
-        use_pbc=True,
-        box_size_nm=box_nm,
-        solution_pH=solution_pH,
-        ionic_strength_mM=ionic_strength_mM,
-        temperature_K=temperature_K,
-    )
+    system, nb = build_system(components, cutoff_nm=cutoff_nm, use_pbc=True, box_size_nm=box_nm)
 
     # Integrator & context
     integrator = openmm.LangevinIntegrator(
