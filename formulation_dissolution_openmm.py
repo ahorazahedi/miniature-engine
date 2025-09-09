@@ -59,6 +59,14 @@ Config JSON schema (minimal):
     "solvation_cutoff_nm": 0.6,
     "concentration_bins": 20,
     "output_frequency": 10
+  },
+  "dissolution_physics": {
+    "enable_noyes_whitney": true,
+    "rate_constant_nm_per_ps": 0.001,
+    "saturation_concentration_beads_per_nm3": 0.1,
+    "min_bead_mass_fraction": 0.05,
+    "concentration_shell_nm": 1.0,
+    "apply_to_components": ["metformin"]
   }
 }
 
@@ -100,6 +108,40 @@ class ComponentSpec:
     label: str
     bead_type: BeadType
     count: int
+
+
+@dataclass
+class DissolvingBead:
+    """Tracks dynamic properties of a dissolving bead."""
+    component_label: str
+    original_mass_amu: float
+    current_mass_amu: float
+    original_sigma_nm: float
+    current_sigma_nm: float
+    current_epsilon_kj_mol: float
+    is_dissolved: bool = False
+    cumulative_dissolved_mass_amu: float = 0.0
+    
+    @property
+    def mass_fraction_remaining(self) -> float:
+        """Fraction of original mass remaining."""
+        return self.current_mass_amu / self.original_mass_amu if self.original_mass_amu > 0 else 0.0
+    
+    @property
+    def surface_area_nm2(self) -> float:
+        """Current surface area assuming spherical bead."""
+        radius_nm = self.current_sigma_nm / 2.0
+        return 4.0 * np.pi * radius_nm * radius_nm
+
+
+@dataclass
+class DissolutionParams:
+    """Noyes-Whitney dissolution parameters."""
+    rate_constant_nm_per_ps: float  # k in Noyes-Whitney equation
+    saturation_concentration_beads_per_nm3: float  # Cs - max solubility
+    min_bead_mass_fraction: float  # Remove bead when mass falls below this fraction
+    concentration_shell_nm: float  # Radius to calculate local concentration
+    apply_to_components: List[str]  # Which components can dissolve (e.g., ["metformin"])
 
 
 # ------------------------------ Defaults / Library ---------------------------
@@ -438,6 +480,163 @@ def track_water_infiltration(
     }
 
 
+def calculate_local_concentration(
+    bead_position_nm: np.ndarray,
+    dissolved_positions_nm: np.ndarray,
+    shell_radius_nm: float,
+) -> float:
+    """Calculate local concentration of dissolved material around a bead.
+    
+    Args:
+        bead_position_nm: Position of the bead
+        dissolved_positions_nm: Positions of dissolved/solubilized beads
+        shell_radius_nm: Radius of concentration calculation shell
+    
+    Returns:
+        Local concentration in beads/nm³
+    """
+    if dissolved_positions_nm.size == 0:
+        return 0.0
+    
+    # Calculate distances to dissolved beads
+    distances = np.sqrt(np.sum((dissolved_positions_nm - bead_position_nm) ** 2, axis=1))
+    
+    # Count dissolved beads within shell
+    dissolved_in_shell = int(np.sum(distances <= shell_radius_nm))
+    
+    # Shell volume
+    shell_volume_nm3 = (4.0/3.0) * np.pi * shell_radius_nm**3
+    
+    return dissolved_in_shell / shell_volume_nm3
+
+
+def apply_noyes_whitney_dissolution(
+    dissolving_beads: List[DissolvingBead],
+    bead_positions_nm: np.ndarray,
+    dissolved_positions_nm: np.ndarray,
+    dissolution_params: DissolutionParams,
+    dt_ps: float,
+) -> Tuple[List[DissolvingBead], List[int]]:
+    """Apply Noyes-Whitney dissolution kinetics to beads.
+    
+    The Noyes-Whitney equation: dM/dt = k·A·(Cs - C)
+    
+    Args:
+        dissolving_beads: List of bead objects to update
+        bead_positions_nm: Current positions of all dissolving beads
+        dissolved_positions_nm: Positions of fully dissolved beads for concentration calc
+        dissolution_params: Dissolution physics parameters
+        dt_ps: Time step in picoseconds
+    
+    Returns:
+        Tuple of (updated_beads, indices_to_remove)
+    """
+    updated_beads = []
+    indices_to_remove = []
+    
+    for i, bead in enumerate(dissolving_beads):
+        if bead.is_dissolved:
+            updated_beads.append(bead)
+            continue
+        
+        # Check if this component should dissolve
+        should_dissolve = any(comp in bead.component_label for comp in dissolution_params.apply_to_components)
+        if not should_dissolve:
+            updated_beads.append(bead)
+            continue
+            
+        # Calculate local concentration around this bead
+        local_concentration = calculate_local_concentration(
+            bead_positions_nm[i],
+            dissolved_positions_nm,
+            dissolution_params.concentration_shell_nm
+        )
+        
+        # Concentration driving force (Cs - C)
+        concentration_gradient = max(0.0, 
+            dissolution_params.saturation_concentration_beads_per_nm3 - local_concentration)
+        
+        if concentration_gradient <= 0.0:
+            # No driving force - saturated local environment
+            updated_beads.append(bead)
+            continue
+        
+        # Apply Noyes-Whitney equation: dM/dt = k·A·(Cs - C)
+        dissolution_rate_amu_per_ps = (
+            dissolution_params.rate_constant_nm_per_ps * 
+            bead.surface_area_nm2 * 
+            concentration_gradient
+        )
+        
+        # Calculate mass loss over time step
+        mass_loss_amu = dissolution_rate_amu_per_ps * dt_ps
+        mass_loss_amu = min(mass_loss_amu, bead.current_mass_amu)  # Can't lose more than current mass
+        
+        # Update bead properties
+        new_bead = DissolvingBead(
+            component_label=bead.component_label,
+            original_mass_amu=bead.original_mass_amu,
+            current_mass_amu=bead.current_mass_amu - mass_loss_amu,
+            original_sigma_nm=bead.original_sigma_nm,
+            current_sigma_nm=bead.current_sigma_nm,  # Will update based on mass
+            current_epsilon_kj_mol=bead.current_epsilon_kj_mol,
+            is_dissolved=bead.is_dissolved,
+            cumulative_dissolved_mass_amu=bead.cumulative_dissolved_mass_amu + mass_loss_amu
+        )
+        
+        # Update size based on mass (assuming constant density)
+        # sigma scales as cube root of mass for spherical beads
+        mass_ratio = new_bead.current_mass_amu / new_bead.original_mass_amu
+        if mass_ratio > 0:
+            new_bead.current_sigma_nm = bead.original_sigma_nm * (mass_ratio ** (1.0/3.0))
+        else:
+            new_bead.current_sigma_nm = 0.0
+        
+        # Check if bead should be considered fully dissolved
+        if new_bead.mass_fraction_remaining <= dissolution_params.min_bead_mass_fraction:
+            new_bead.is_dissolved = True
+            new_bead.cumulative_dissolved_mass_amu = new_bead.original_mass_amu
+            indices_to_remove.append(i)
+        
+        updated_beads.append(new_bead)
+    
+    return updated_beads, indices_to_remove
+
+
+def update_nonbonded_parameters(
+    nb_force: openmm.NonbondedForce,
+    dissolving_beads: List[DissolvingBead],
+    context: openmm.Context,
+) -> None:
+    """Update OpenMM NonbondedForce parameters for dissolving beads.
+    
+    Args:
+        nb_force: OpenMM NonbondedForce to modify
+        dissolving_beads: Current bead states
+        context: OpenMM context to reinitialize after parameter updates
+    """
+    for i, bead in enumerate(dissolving_beads):
+        if bead.is_dissolved:
+            # Set dissolved beads to minimal interaction
+            nb_force.setParticleParameters(
+                i,
+                0.0 * unit.elementary_charge,  # charge
+                0.01 * unit.nanometer,  # very small sigma
+                0.001 * unit.kilojoule_per_mole,  # minimal epsilon
+            )
+        else:
+            # Update with current dissolution state
+            nb_force.setParticleParameters(
+                i,
+                0.0 * unit.elementary_charge,  # charge
+                bead.current_sigma_nm * unit.nanometer,  # current size
+                bead.current_epsilon_kj_mol * unit.kilojoule_per_mole,  # current interaction
+            )
+    
+    # Reinitialize context to apply parameter changes
+    context.reinitialize(preserveState=True)
+
+
 # ------------------------------ System Construction --------------------------
 
 
@@ -735,17 +934,60 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
     concentration_bins = int(analysis_cfg.get("concentration_bins", 20))
     output_frequency = int(analysis_cfg.get("output_frequency", 10))  # Steps between analysis outputs
     
+    # Dissolution physics configuration
+    dissolution_cfg = cfg.get("dissolution_physics", {})
+    enable_noyes_whitney = bool(dissolution_cfg.get("enable_noyes_whitney", False))
+    dissolution_params = None
+    dissolving_beads = []
+    dissolved_positions = np.zeros((0, 3))  # Track positions of fully dissolved beads
+    
+    if enable_noyes_whitney:
+        dissolution_params = DissolutionParams(
+            rate_constant_nm_per_ps=float(dissolution_cfg.get("rate_constant_nm_per_ps", 0.001)),
+            saturation_concentration_beads_per_nm3=float(dissolution_cfg.get("saturation_concentration_beads_per_nm3", 0.1)),
+            min_bead_mass_fraction=float(dissolution_cfg.get("min_bead_mass_fraction", 0.05)),
+            concentration_shell_nm=float(dissolution_cfg.get("concentration_shell_nm", 1.0)),
+            apply_to_components=dissolution_cfg.get("apply_to_components", ["metformin"])
+        )
+        
+        # Initialize DissolvingBead objects for dissolving components
+        for comp in components_all:
+            if any(target in comp.label for target in dissolution_params.apply_to_components):
+                for _ in range(comp.count):
+                    dissolving_beads.append(DissolvingBead(
+                        component_label=comp.label,
+                        original_mass_amu=comp.bead_type.mass_amu,
+                        current_mass_amu=comp.bead_type.mass_amu,
+                        original_sigma_nm=comp.bead_type.sigma_nm,
+                        current_sigma_nm=comp.bead_type.sigma_nm,
+                        current_epsilon_kj_mol=comp.bead_type.epsilon_kj_mol,
+                    ))
+            else:
+                # Non-dissolving components get placeholder beads
+                for _ in range(comp.count):
+                    dissolving_beads.append(DissolvingBead(
+                        component_label=comp.label,
+                        original_mass_amu=comp.bead_type.mass_amu,
+                        current_mass_amu=comp.bead_type.mass_amu,
+                        original_sigma_nm=comp.bead_type.sigma_nm,
+                        current_sigma_nm=comp.bead_type.sigma_nm,
+                        current_epsilon_kj_mol=comp.bead_type.epsilon_kj_mol,
+                        is_dissolved=False  # Non-dissolving components never dissolve
+                    ))
+    
     # Output setup
     metrics_path = f"{output_prefix}_metrics.csv"
     solvation_path = f"{output_prefix}_solvation.csv"
     concentration_path = f"{output_prefix}_concentration.csv"
     penetration_path = f"{output_prefix}_penetration.csv"
+    dissolution_path = f"{output_prefix}_dissolution.csv"
     pdb_path = f"{output_prefix}_final_positions.pdb"
     
     # Create analysis output files if water is present
     solvation_file = open(solvation_path, "w", newline="") if water_indices else None
     concentration_file = open(concentration_path, "w", newline="")
     penetration_file = open(penetration_path, "w", newline="") if water_indices else None
+    dissolution_file = open(dissolution_path, "w", newline="") if enable_noyes_whitney else None
     
     try:
         with open(metrics_path, "w", newline="") as csvfile:
@@ -756,6 +998,7 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
             solvation_writer = None
             concentration_writer = None
             penetration_writer = None
+            dissolution_writer = None
             
             if solvation_file:
                 solvation_writer = csv.writer(solvation_file)
@@ -774,6 +1017,11 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                 penetration_writer = csv.writer(penetration_file)
                 penetration_writer.writerow(["time_ps", "water_inside_tablet", "max_penetration_depth_nm", 
                                            "fraction_infiltrated"])
+            
+            if dissolution_file:
+                dissolution_writer = csv.writer(dissolution_file)
+                dissolution_writer.writerow(["time_ps", "total_dissolved_mass_amu", "mean_mass_fraction_remaining", 
+                                           "num_fully_dissolved", "dissolution_rate_amu_per_ps"])
 
             # Heuristics for dissolution classification
             radial_margin_nm = 1.5
@@ -835,6 +1083,29 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                         f"{infiltration_stats['max_penetration_depth_nm']:.4f}",
                         f"{infiltration_stats['fraction_infiltrated']:.6f}",
                     ])
+                
+                # Dissolution kinetics output
+                if dissolution_writer and enable_noyes_whitney:
+                    # Calculate dissolution metrics
+                    total_dissolved_mass = sum(bead.cumulative_dissolved_mass_amu for bead in dissolving_beads)
+                    active_beads = [bead for bead in dissolving_beads if any(comp in bead.component_label for comp in dissolution_params.apply_to_components)]
+                    if active_beads:
+                        mean_mass_fraction = sum(bead.mass_fraction_remaining for bead in active_beads) / len(active_beads)
+                        num_fully_dissolved = sum(1 for bead in active_beads if bead.is_dissolved)
+                        # Approximate dissolution rate from last time step
+                        dissolution_rate = total_dissolved_mass / max(time_ps, dt_ps) if time_ps > 0 else 0.0
+                    else:
+                        mean_mass_fraction = 0.0
+                        num_fully_dissolved = 0
+                        dissolution_rate = 0.0
+                    
+                    dissolution_writer.writerow([
+                        f"{time_ps:.3f}",
+                        f"{total_dissolved_mass:.4f}",
+                        f"{mean_mass_fraction:.6f}",
+                        num_fully_dissolved,
+                        f"{dissolution_rate:.6f}",
+                    ])
             
             write_analysis_data(0)
 
@@ -845,6 +1116,30 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
             for step in step_iter:
                 integrator.step(1)
                 time_ps += dt_ps
+                
+                # Apply Noyes-Whitney dissolution kinetics if enabled
+                if enable_noyes_whitney and dissolution_params:
+                    state = context.getState(getPositions=True)
+                    current_pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                    
+                    # Apply dissolution kinetics
+                    dissolving_beads, indices_to_remove = apply_noyes_whitney_dissolution(
+                        dissolving_beads,
+                        current_pos_nm,
+                        dissolved_positions,
+                        dissolution_params,
+                        dt_ps
+                    )
+                    
+                    # Update positions of dissolved beads for concentration calculations
+                    if indices_to_remove:
+                        dissolved_pos_list = [current_pos_nm[i] for i in indices_to_remove]
+                        if dissolved_pos_list:
+                            new_dissolved = np.array(dissolved_pos_list)
+                            dissolved_positions = np.vstack([dissolved_positions, new_dissolved]) if dissolved_positions.size > 0 else new_dissolved
+                    
+                    # Update OpenMM parameters for changed beads
+                    update_nonbonded_parameters(nb, dissolving_beads, context)
 
                 if step % report_interval_steps == 0 or step == steps:
                     state = context.getState(getPositions=True)
@@ -896,6 +1191,8 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
             concentration_file.close()
         if penetration_file:
             penetration_file.close()
+        if dissolution_file:
+            dissolution_file.close()
 
     # Final structure output (exclude water beads, include all other ingredients)
     final_state = context.getState(getPositions=True)
