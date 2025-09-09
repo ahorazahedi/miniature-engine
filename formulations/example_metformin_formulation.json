@@ -43,7 +43,10 @@
         "role": "lubricant",
         "beads": 50
       }
-    ]
+    ],
+    "water": {
+      "beads": 5000
+    }
   }
 }
 

@@ -4,15 +4,18 @@ Coarse-grained dissolution simulator for a single tablet formulation using OpenM
 
 This script ignores any existing project code and builds a minimal, self-contained
 coarse-grained (CG) molecular dynamics model that approximates dissolution behavior
-for a metformin tablet with excipients (filler, binder, lubricant, others).
+for a metformin tablet with excipients (filler, binder, lubricant, others). Optionally,
+explicit CG water beads can be included to model solvation, concentration gradients,
+and wetting/penetration more realistically than with implicit solvent alone.
 
 Core ideas (simplified for speed and robustness):
 - Represent each component (metformin, filler, binder, lubricant, other) as CG beads.
 - Beads interact via Lennard-Jones (LJ) potentials with type-specific epsilon/sigma.
 - No permanent bonds are used; cohesion is via LJ attraction (binder has stronger
   cohesion with others). This allows the cluster to disperse under thermal motion.
-- Use implicit solvent (no explicit water) with Langevin dynamics to approximate
-  hydrodynamic/solvent effects while keeping runtime small and avoiding water models.
+- Default uses implicit solvent (no explicit water) with Langevin dynamics to approximate
+  hydrodynamic/solvent effects while keeping runtime small. Optionally, enable explicit
+  water to simulate solvation, diffusion, and wetting.
 - Track dissolution as metformin beads that have left the tablet region and have no
   close contacts within a cutoff (i.e., solubilized). Output a CSV time series.
 
@@ -26,6 +29,8 @@ Usage:
 
 Outputs:
 - <output>_metrics.csv: time_ps, num_dissolved, fraction_dissolved, tablet_radius_nm
+  (tablet metrics computed using non-water beads; dissolution classification uses water
+   neighbors if explicit water is present)
 - <output>_final_positions.pdb: final bead positions for visualization (CG atoms)
 
 Config JSON schema (minimal):
@@ -42,7 +47,8 @@ Config JSON schema (minimal):
       {"name": "microcrystalline_cellulose", "role": "filler", "beads": 200},
       {"name": "povidone", "role": "binder", "beads": 120},
       {"name": "magnesium_stearate", "role": "lubricant", "beads": 50}
-    ]
+    ],
+    "water": {"beads": 30000}
   }
 }
 
@@ -94,6 +100,8 @@ def get_default_bead_library() -> Dict[str, BeadType]:
     return {
         # Metformin: small, hydrophilic API
         "metformin": BeadType(name="metformin", epsilon_kj_mol=1.10, sigma_nm=0.47, mass_amu=129.0),
+        # Water (CG one-bead): small sigma, moderate epsilon
+        "water": BeadType(name="water", epsilon_kj_mol=0.75, sigma_nm=0.32, mass_amu=18.0),
         # Filler examples
         "microcrystalline_cellulose": BeadType(
             name="microcrystalline_cellulose", epsilon_kj_mol=0.85, sigma_nm=0.52, mass_amu=162.0
@@ -217,6 +225,87 @@ def count_dissolved_metformin(
     return count
 
 
+def count_dissolved_metformin_explicit(
+    met_positions_nm: np.ndarray,
+    all_positions_nm: np.ndarray,
+    nonwater_positions_nm: np.ndarray,
+    water_positions_nm: np.ndarray,
+    centroid_nm: np.ndarray,
+    tablet_radius_nm: float,
+    radial_margin_nm: float,
+    contact_cutoff_nm: float,
+    water_shell_nm: float,
+    min_water_neighbors: int = 1,
+) -> int:
+    """Count metformin beads considered dissolved when explicit water is present.
+
+    Criteria:
+    - Radially outside tablet: r > tablet_radius + radial_margin
+    - Has >= min_water_neighbors within water_shell_nm
+    - Has no non-water neighbors within contact_cutoff_nm
+    """
+    if met_positions_nm.size == 0:
+        return 0
+    disp = met_positions_nm - centroid_nm
+    r = np.sqrt(np.sum(disp * disp, axis=1))
+    radial_mask = r > (tablet_radius_nm + radial_margin_nm)
+    if not np.any(radial_mask):
+        return 0
+    candidates = met_positions_nm[radial_mask]
+    count = 0
+    contact2 = contact_cutoff_nm * contact_cutoff_nm
+    shell2 = water_shell_nm * water_shell_nm
+    for pos in candidates:
+        # Non-water close contacts (including metformin & excipients)
+        if nonwater_positions_nm.size:
+            d2_nonwater = np.sum((nonwater_positions_nm - pos) ** 2, axis=1)
+            # Subtract self later by requiring > 0 neighbors strictly
+            close_nonwater = np.sum(d2_nonwater < contact2) - 1  # exclude self if present
+            if close_nonwater > 0:
+                continue
+        # Water neighbors in solvation shell
+        if water_positions_nm.size:
+            d2_water = np.sum((water_positions_nm - pos) ** 2, axis=1)
+            n_water = int(np.sum(d2_water < shell2))
+            if n_water >= min_water_neighbors:
+                count += 1
+        else:
+            # No water present; cannot consider dissolved under explicit criterion
+            pass
+    return count
+
+
+def generate_water_positions_excluding_sphere(
+    count: int,
+    box_size_nm: float,
+    exclude_center_nm: np.ndarray,
+    exclude_radius_nm: float,
+    seed: int,
+) -> np.ndarray:
+    """Generate uniformly random water positions in the box excluding a spherical region.
+
+    Rejection sampling in batches for simplicity.
+    """
+    if count <= 0:
+        return np.zeros((0, 3), dtype=float)
+    rng = np.random.default_rng(seed + 1337)
+    positions: List[np.ndarray] = []
+    batch = max(1024, min(65536, count * 2))
+    excl_center = exclude_center_nm.reshape(1, 3)
+    excl_r2 = exclude_radius_nm * exclude_radius_nm
+    accepted = 0
+    while accepted < count:
+        candidates = rng.random((batch, 3)) * box_size_nm
+        d2 = np.sum((candidates - excl_center) ** 2, axis=1)
+        keep_mask = d2 > excl_r2
+        kept = candidates[keep_mask]
+        if kept.size:
+            positions.append(kept)
+            accepted += kept.shape[0]
+    positions_nm = np.vstack(positions)[:count]
+    return positions_nm
+
+
 # ------------------------------ System Construction --------------------------
 
 
@@ -317,14 +406,16 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
     if not formulation:
         raise ValueError("Config missing 'formulation' block.")
 
-    components: List[ComponentSpec] = []
+    # Build components, separating tablet (non-water) and water
+    tablet_components: List[ComponentSpec] = []
+    water_component: ComponentSpec = None
 
     # Metformin
     met_spec = formulation.get("metformin", {})
     met_beads = int(met_spec.get("beads", met_spec.get("molecules", 200)))
     met_params = met_spec.get("parameters", {})
     met_type = resolve_bead_type("metformin", met_params)
-    components.append(ComponentSpec(label="metformin", bead_type=met_type, count=met_beads))
+    tablet_components.append(ComponentSpec(label="metformin", bead_type=met_type, count=met_beads))
 
     # Excipients
     for item in formulation.get("excipients", []):
@@ -334,22 +425,56 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
         count = int(item.get("beads", 100))
         params = item.get("parameters", {})
         bead_type = resolve_bead_type(name, params)
-        components.append(ComponentSpec(label=label, bead_type=bead_type, count=count))
+        tablet_components.append(ComponentSpec(label=label, bead_type=bead_type, count=count))
 
-    # Create initial positions (cluster) and labels
-    counts = {comp.label: comp.count for comp in components}
+    # Optional explicit water
+    water_spec = formulation.get("water", {})
+    water_beads = int(water_spec.get("beads", 0))
+    if water_beads > 0:
+        water_params = water_spec.get("parameters", {})
+        water_type = resolve_bead_type("water", water_params)
+        water_component = ComponentSpec(label="water", bead_type=water_type, count=water_beads)
+
+    # Create initial positions for tablet as a compact cluster
+    counts_tablet = {comp.label: comp.count for comp in tablet_components}
     spacing_nm = 0.60  # lattice spacing roughly corresponding to sigma scale
-    positions_by_label = generate_cluster_positions(counts, spacing_nm, box_nm, random_seed)
-    labels: List[str] = []
-    positions_list: List[np.ndarray] = []
-    for comp in components:
-        labels.extend([comp.label] * comp.count)
-        positions_list.append(positions_by_label[comp.label])
-    positions_nm = np.vstack(positions_list)
+    positions_by_label_tablet = generate_cluster_positions(counts_tablet, spacing_nm, box_nm, random_seed)
+    labels_tablet: List[str] = []
+    positions_list_tablet: List[np.ndarray] = []
+    for comp in tablet_components:
+        labels_tablet.extend([comp.label] * comp.count)
+        positions_list_tablet.append(positions_by_label_tablet[comp.label])
+    positions_tablet_nm = np.vstack(positions_list_tablet) if positions_list_tablet else np.zeros((0, 3))
 
-    # Build system
+    # Estimate tablet centroid/radius from tablet beads only
+    centroid_tablet = compute_centroid(positions_tablet_nm) if positions_tablet_nm.size else np.array([
+        0.5 * box_nm, 0.5 * box_nm, 0.5 * box_nm
+    ])
+    tablet_radius_est = compute_tablet_radius_nm(positions_tablet_nm, centroid_tablet) if positions_tablet_nm.size else 0.5
+
+    # Generate water positions outside tablet region
+    labels: List[str] = list(labels_tablet)
+    positions_list: List[np.ndarray] = [positions_tablet_nm]
+    if water_component is not None:
+        water_exclusion_margin_nm = 0.8
+        positions_water_nm = generate_water_positions_excluding_sphere(
+            water_component.count,
+            box_size_nm=box_nm,
+            exclude_center_nm=centroid_tablet,
+            exclude_radius_nm=tablet_radius_est + water_exclusion_margin_nm,
+            seed=random_seed,
+        )
+        labels.extend(["water"] * water_component.count)
+        positions_list.append(positions_water_nm)
+
+    positions_nm = np.vstack(positions_list) if positions_list else np.zeros((0, 3))
+
+    # Build system using all components
+    components_all: List[ComponentSpec] = list(tablet_components)
+    if water_component is not None:
+        components_all.append(water_component)
     cutoff_nm = 1.2
-    system, nb = build_system(components, cutoff_nm=cutoff_nm, use_pbc=True, box_size_nm=box_nm)
+    system, nb = build_system(components_all, cutoff_nm=cutoff_nm, use_pbc=True, box_size_nm=box_nm)
 
     # Integrator & context
     integrator = openmm.LangevinIntegrator(
@@ -373,18 +498,32 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
     time_ps = 0.0
     dt_ps = timestep_fs * 0.001
 
-    # Initial metrics
+    # Index bookkeeping
+    met_indices: List[int] = []
+    water_indices: List[int] = []
+    nonwater_indices: List[int] = []
+    start = 0
+    for comp in components_all:
+        indices = list(range(start, start + comp.count))
+        if comp.label == "metformin":
+            met_indices.extend(indices)
+        if comp.label == "water":
+            water_indices.extend(indices)
+        else:
+            nonwater_indices.extend(indices)
+        start += comp.count
+
+    # Initial metrics (compute centroid/radius using non-water)
     state = context.getState(getPositions=True)
     pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    centroid = compute_centroid(pos_nm)
-    tablet_radius = compute_tablet_radius_nm(pos_nm, centroid)
-
-    met_indices = []
-    start = 0
-    for comp in components:
-        if comp.label == "metformin":
-            met_indices.extend(range(start, start + comp.count))
-        start += comp.count
+    if nonwater_indices:
+        pos_nonwater = pos_nm[nonwater_indices]
+    else:
+        pos_nonwater = pos_nm
+    centroid = compute_centroid(pos_nonwater) if pos_nonwater.size else np.array([
+        0.5 * box_nm, 0.5 * box_nm, 0.5 * box_nm
+    ])
+    tablet_radius = compute_tablet_radius_nm(pos_nonwater, centroid) if pos_nonwater.size else 0.5
 
     # Output setup
     metrics_path = f"{output_prefix}_metrics.csv"
@@ -396,12 +535,29 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
         # Heuristics for dissolution classification
         radial_margin_nm = 1.5
         contact_cutoff_nm = 0.8
+        water_shell_nm = 0.6
 
         # Write initial line
-        met_pos = pos_nm[met_indices]
-        dissolved = count_dissolved_metformin(
-            met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
-        )
+        met_pos = pos_nm[met_indices] if met_indices else np.zeros((0, 3))
+        if water_indices:
+            water_pos = pos_nm[water_indices]
+            nonwater_pos = pos_nm[nonwater_indices] if nonwater_indices else np.zeros((0, 3))
+            dissolved = count_dissolved_metformin_explicit(
+                met_pos,
+                pos_nm,
+                nonwater_pos,
+                water_pos,
+                centroid,
+                tablet_radius,
+                radial_margin_nm,
+                contact_cutoff_nm,
+                water_shell_nm,
+                min_water_neighbors=1,
+            )
+        else:
+            dissolved = count_dissolved_metformin(
+                met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
+            )
         frac = (dissolved / len(met_indices)) if met_indices else 0.0
         writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
 
@@ -413,12 +569,35 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
             if step % report_interval_steps == 0 or step == steps:
                 state = context.getState(getPositions=True)
                 pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-                centroid = compute_centroid(pos_nm)
-                tablet_radius = compute_tablet_radius_nm(pos_nm, centroid)
-                met_pos = pos_nm[met_indices]
-                dissolved = count_dissolved_metformin(
-                    met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
-                )
+                # Compute centroid/radius from non-water positions
+                if nonwater_indices:
+                    pos_nonwater = pos_nm[nonwater_indices]
+                else:
+                    pos_nonwater = pos_nm
+                centroid = compute_centroid(pos_nonwater) if pos_nonwater.size else np.array([
+                    0.5 * box_nm, 0.5 * box_nm, 0.5 * box_nm
+                ])
+                tablet_radius = compute_tablet_radius_nm(pos_nonwater, centroid) if pos_nonwater.size else 0.5
+                met_pos = pos_nm[met_indices] if met_indices else np.zeros((0, 3))
+                if water_indices:
+                    water_pos = pos_nm[water_indices]
+                    nonwater_pos = pos_nm[nonwater_indices] if nonwater_indices else np.zeros((0, 3))
+                    dissolved = count_dissolved_metformin_explicit(
+                        met_pos,
+                        pos_nm,
+                        nonwater_pos,
+                        water_pos,
+                        centroid,
+                        tablet_radius,
+                        radial_margin_nm,
+                        contact_cutoff_nm,
+                        water_shell_nm,
+                        min_water_neighbors=1,
+                    )
+                else:
+                    dissolved = count_dissolved_metformin(
+                        met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
+                    )
                 frac = (dissolved / len(met_indices)) if met_indices else 0.0
                 writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
 
