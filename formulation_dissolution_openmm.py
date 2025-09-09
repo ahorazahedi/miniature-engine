@@ -49,6 +49,16 @@ Config JSON schema (minimal):
       {"name": "magnesium_stearate", "role": "lubricant", "beads": 50}
     ],
     "water": {"beads": 30000}
+  },
+  "mixing_rules": {
+    "water_metformin": {"epsilon": 3.0, "sigma": 0.39},
+    "water_magnesium_stearate": {"epsilon": 0.3, "sigma": 0.47},
+    "water_povidone": {"epsilon": 2.2, "sigma": 0.43}
+  },
+  "analysis": {
+    "solvation_cutoff_nm": 0.6,
+    "concentration_bins": 20,
+    "output_frequency": 10
   }
 }
 
@@ -104,8 +114,8 @@ def get_default_bead_library() -> Dict[str, BeadType]:
     return {
         # Metformin: small, hydrophilic API
         "metformin": BeadType(name="metformin", epsilon_kj_mol=1.10, sigma_nm=0.47, mass_amu=129.0),
-        # Water (CG one-bead): small sigma, moderate epsilon
-        "water": BeadType(name="water", epsilon_kj_mol=0.75, sigma_nm=0.32, mass_amu=18.0),
+        # Water (CG one-bead): small sigma, stronger epsilon for realistic bulk behavior
+        "water": BeadType(name="water", epsilon_kj_mol=2.0, sigma_nm=0.32, mass_amu=18.0),
         # Filler examples
         "microcrystalline_cellulose": BeadType(
             name="microcrystalline_cellulose", epsilon_kj_mol=0.85, sigma_nm=0.52, mass_amu=162.0
@@ -310,6 +320,124 @@ def generate_water_positions_excluding_sphere(
     return positions_nm
 
 
+# ------------------------------ Analysis Functions ---------------------------
+
+
+def analyze_solvation_shells(
+    met_positions_nm: np.ndarray,
+    water_positions_nm: np.ndarray,
+    solvation_cutoff_nm: float = 0.6,
+) -> Dict[str, float]:
+    """Analyze solvation shells around metformin beads.
+    
+    Returns:
+        Dict with statistics: mean_solvation_number, std_solvation_number,
+                            min_solvation_number, max_solvation_number
+    """
+    if met_positions_nm.size == 0 or water_positions_nm.size == 0:
+        return {
+            "mean_solvation_number": 0.0,
+            "std_solvation_number": 0.0,
+            "min_solvation_number": 0.0,
+            "max_solvation_number": 0.0,
+        }
+    
+    solvation_numbers = []
+    cutoff2 = solvation_cutoff_nm * solvation_cutoff_nm
+    
+    for met_pos in met_positions_nm:
+        # Calculate distances to all water molecules
+        d2 = np.sum((water_positions_nm - met_pos) ** 2, axis=1)
+        n_solvating = int(np.sum(d2 < cutoff2))
+        solvation_numbers.append(n_solvating)
+    
+    solvation_numbers = np.array(solvation_numbers)
+    
+    return {
+        "mean_solvation_number": float(np.mean(solvation_numbers)),
+        "std_solvation_number": float(np.std(solvation_numbers)),
+        "min_solvation_number": float(np.min(solvation_numbers)),
+        "max_solvation_number": float(np.max(solvation_numbers)),
+    }
+
+
+def calculate_radial_concentration(
+    met_positions_nm: np.ndarray,
+    centroid_nm: np.ndarray,
+    box_size_nm: float,
+    bins: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate radial concentration profile of metformin from tablet center.
+    
+    Returns:
+        bin_centers_nm: Radial distances (bin centers)
+        concentrations: Metformin concentration in each bin (beads/nm³)
+    """
+    if met_positions_nm.size == 0:
+        bin_centers = np.linspace(0, box_size_nm/2, bins)
+        return bin_centers, np.zeros_like(bin_centers)
+    
+    # Calculate distances from centroid
+    disp = met_positions_nm - centroid_nm
+    r = np.sqrt(np.sum(disp * disp, axis=1))
+    
+    # Create radial bins
+    max_radius = min(box_size_nm / 2, np.max(r) * 1.1)
+    bin_edges = np.linspace(0, max_radius, bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Count metformin beads in each bin
+    counts, _ = np.histogram(r, bins=bin_edges)
+    
+    # Calculate bin volumes (spherical shells)
+    bin_volumes = (4/3) * np.pi * (bin_edges[1:]**3 - bin_edges[:-1]**3)
+    
+    # Calculate concentrations (beads per nm³)
+    concentrations = counts / bin_volumes
+    
+    return bin_centers, concentrations
+
+
+def track_water_infiltration(
+    water_positions_nm: np.ndarray,
+    tablet_centroid_nm: np.ndarray,
+    tablet_radius_nm: float,
+) -> Dict[str, float]:
+    """Track water infiltration into the tablet region.
+    
+    Returns:
+        Dict with metrics: water_inside_tablet, max_penetration_depth_nm,
+                         fraction_infiltrated
+    """
+    if water_positions_nm.size == 0:
+        return {
+            "water_inside_tablet": 0.0,
+            "max_penetration_depth_nm": 0.0,
+            "fraction_infiltrated": 0.0,
+        }
+    
+    # Calculate distances from tablet center
+    disp = water_positions_nm - tablet_centroid_nm
+    r = np.sqrt(np.sum(disp * disp, axis=1))
+    
+    # Count water inside tablet region
+    inside_mask = r <= tablet_radius_nm
+    water_inside = int(np.sum(inside_mask))
+    
+    # Calculate maximum penetration depth
+    max_penetration = tablet_radius_nm - np.min(r) if r.size > 0 else 0.0
+    max_penetration = max(0.0, max_penetration)  # Can't be negative
+    
+    # Fraction of water that has infiltrated
+    fraction_infiltrated = water_inside / len(water_positions_nm)
+    
+    return {
+        "water_inside_tablet": float(water_inside),
+        "max_penetration_depth_nm": float(max_penetration),
+        "fraction_infiltrated": float(fraction_infiltrated),
+    }
+
+
 # ------------------------------ System Construction --------------------------
 
 
@@ -352,6 +480,74 @@ def build_system(
 
     system.addForce(nb)
     return system, nb
+
+
+def apply_custom_mixing_rules(
+    nb_force: openmm.NonbondedForce,
+    components: List[ComponentSpec],
+    mixing_rules: Dict[str, Dict[str, float]] = None,
+) -> None:
+    """Apply custom mixing rules for specific component interactions using addException().
+    
+    This function overrides default Lorentz-Berthelot combining rules with realistic
+    interaction parameters, particularly for water-component pairs.
+    
+    Args:
+        nb_force: The NonbondedForce object to modify
+        components: List of component specifications in particle order
+        mixing_rules: Optional dict of custom interaction parameters
+                     Format: {"water_metformin": {"epsilon": 3.0, "sigma": 0.39}}
+    """
+    if mixing_rules is None:
+        # Default enhanced mixing rules for realistic solvation behavior
+        mixing_rules = {
+            "water_metformin": {"epsilon": 3.0, "sigma": 0.39},  # Strong hydrophilic interaction
+            "water_magnesium_stearate": {"epsilon": 0.3, "sigma": 0.47},  # Weak hydrophobic interaction
+            "water_povidone": {"epsilon": 2.2, "sigma": 0.43},  # Moderate binder interaction
+            "water_hypromellose": {"epsilon": 2.0, "sigma": 0.44},  # Moderate binder interaction
+        }
+    
+    # Build particle index mapping by component type
+    particle_indices: Dict[str, List[int]] = {}
+    start_idx = 0
+    for comp in components:
+        # Extract base component name (remove role prefix if present)
+        comp_name = comp.label.split(":")[-1] if ":" in comp.label else comp.label
+        if comp_name not in particle_indices:
+            particle_indices[comp_name] = []
+        particle_indices[comp_name].extend(range(start_idx, start_idx + comp.count))
+        start_idx += comp.count
+    
+    # Apply custom mixing rules via exceptions
+    for rule_key, params in mixing_rules.items():
+        parts = rule_key.split("_", 1)
+        if len(parts) != 2:
+            continue
+        comp1_name, comp2_name = parts
+        
+        if comp1_name not in particle_indices or comp2_name not in particle_indices:
+            continue
+            
+        indices1 = particle_indices[comp1_name]
+        indices2 = particle_indices[comp2_name]
+        
+        epsilon = params.get("epsilon", 1.0) * unit.kilojoule_per_mole
+        sigma = params.get("sigma", 0.5) * unit.nanometer
+        
+        # Add exceptions for all pairs between these component types
+        for i1 in indices1:
+            for i2 in indices2:
+                if i1 != i2:  # Don't add self-interactions
+                    # addException(i, j, chargeProd, sigma, epsilon)
+                    nb_force.addException(
+                        i1, i2, 
+                        0.0 * unit.elementary_charge**2,  # No charge interactions
+                        sigma,
+                        epsilon
+                    )
+        
+        print(f"Applied custom mixing rule {rule_key}: ε={params['epsilon']:.2f} kJ/mol, σ={params['sigma']:.3f} nm")
+        print(f"  Affected {len(indices1)} × {len(indices2)} particle pairs")
 
 
 # ------------------------------ PDB Export (CG) -------------------------------
@@ -479,6 +675,10 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
         components_all.append(water_component)
     cutoff_nm = 1.2
     system, nb = build_system(components_all, cutoff_nm=cutoff_nm, use_pbc=True, box_size_nm=box_nm)
+    
+    # Apply custom mixing rules for realistic solvation behavior
+    mixing_rules_config = cfg.get("mixing_rules", {})
+    apply_custom_mixing_rules(nb, components_all, mixing_rules_config if mixing_rules_config else None)
 
     # Integrator & context
     integrator = openmm.LangevinIntegrator(
@@ -529,84 +729,173 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
     ])
     tablet_radius = compute_tablet_radius_nm(pos_nonwater, centroid) if pos_nonwater.size else 0.5
 
+    # Analysis configuration
+    analysis_cfg = cfg.get("analysis", {})
+    solvation_cutoff_nm = float(analysis_cfg.get("solvation_cutoff_nm", 0.6))
+    concentration_bins = int(analysis_cfg.get("concentration_bins", 20))
+    output_frequency = int(analysis_cfg.get("output_frequency", 10))  # Steps between analysis outputs
+    
     # Output setup
     metrics_path = f"{output_prefix}_metrics.csv"
+    solvation_path = f"{output_prefix}_solvation.csv"
+    concentration_path = f"{output_prefix}_concentration.csv"
+    penetration_path = f"{output_prefix}_penetration.csv"
     pdb_path = f"{output_prefix}_final_positions.pdb"
-    with open(metrics_path, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["time_ps", "num_dissolved", "fraction_dissolved", "tablet_radius_nm"])
-
-        # Heuristics for dissolution classification
-        radial_margin_nm = 1.5
-        contact_cutoff_nm = 0.8
-        water_shell_nm = 0.6
-
-        # Write initial line
-        met_pos = pos_nm[met_indices] if met_indices else np.zeros((0, 3))
-        if water_indices:
-            water_pos = pos_nm[water_indices]
-            nonwater_pos = pos_nm[nonwater_indices] if nonwater_indices else np.zeros((0, 3))
-            dissolved = count_dissolved_metformin_explicit(
-                met_pos,
-                pos_nm,
-                nonwater_pos,
-                water_pos,
-                centroid,
-                tablet_radius,
-                radial_margin_nm,
-                contact_cutoff_nm,
-                water_shell_nm,
-                min_water_neighbors=1,
+    
+    # Create analysis output files if water is present
+    solvation_file = open(solvation_path, "w", newline="") if water_indices else None
+    concentration_file = open(concentration_path, "w", newline="")
+    penetration_file = open(penetration_path, "w", newline="") if water_indices else None
+    
+    try:
+        with open(metrics_path, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["time_ps", "num_dissolved", "fraction_dissolved", "tablet_radius_nm"])
+            
+            # Initialize analysis writers
+            solvation_writer = None
+            concentration_writer = None
+            penetration_writer = None
+            
+            if solvation_file:
+                solvation_writer = csv.writer(solvation_file)
+                solvation_writer.writerow(["time_ps", "mean_solvation_number", "std_solvation_number", 
+                                         "min_solvation_number", "max_solvation_number"])
+            
+            concentration_writer = csv.writer(concentration_file)
+            # Write header with bin center positions
+            bin_centers, _ = calculate_radial_concentration(
+                np.zeros((0, 3)), np.array([0, 0, 0]), box_nm, concentration_bins
             )
-        else:
-            dissolved = count_dissolved_metformin(
-                met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
-            )
-        frac = (dissolved / len(met_indices)) if met_indices else 0.0
-        writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
+            conc_header = ["time_ps"] + [f"concentration_r_{r:.3f}_nm" for r in bin_centers]
+            concentration_writer.writerow(conc_header)
+            
+            if penetration_file:
+                penetration_writer = csv.writer(penetration_file)
+                penetration_writer.writerow(["time_ps", "water_inside_tablet", "max_penetration_depth_nm", 
+                                           "fraction_infiltrated"])
 
-        # Dynamics
-        step_iter = range(1, steps + 1)
-        if tqdm is not None:
-            step_iter = tqdm(step_iter, total=steps, desc="Simulating", unit="step")
-        for step in step_iter:
-            integrator.step(1)
-            time_ps += dt_ps
+            # Heuristics for dissolution classification
+            radial_margin_nm = 1.5
+            contact_cutoff_nm = 0.8
+            water_shell_nm = 0.6
 
-            if step % report_interval_steps == 0 or step == steps:
-                state = context.getState(getPositions=True)
-                pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-                # Compute centroid/radius from non-water positions
-                if nonwater_indices:
-                    pos_nonwater = pos_nm[nonwater_indices]
-                else:
-                    pos_nonwater = pos_nm
-                centroid = compute_centroid(pos_nonwater) if pos_nonwater.size else np.array([
-                    0.5 * box_nm, 0.5 * box_nm, 0.5 * box_nm
-                ])
-                tablet_radius = compute_tablet_radius_nm(pos_nonwater, centroid) if pos_nonwater.size else 0.5
-                met_pos = pos_nm[met_indices] if met_indices else np.zeros((0, 3))
-                if water_indices:
+            # Write initial line
+            met_pos = pos_nm[met_indices] if met_indices else np.zeros((0, 3))
+            if water_indices:
+                water_pos = pos_nm[water_indices]
+                nonwater_pos = pos_nm[nonwater_indices] if nonwater_indices else np.zeros((0, 3))
+                dissolved = count_dissolved_metformin_explicit(
+                    met_pos,
+                    pos_nm,
+                    nonwater_pos,
+                    water_pos,
+                    centroid,
+                    tablet_radius,
+                    radial_margin_nm,
+                    contact_cutoff_nm,
+                    water_shell_nm,
+                    min_water_neighbors=1,
+                )
+            else:
+                dissolved = count_dissolved_metformin(
+                    met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
+                )
+            frac = (dissolved / len(met_indices)) if met_indices else 0.0
+            writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
+            
+            # Initial analysis output
+            def write_analysis_data(step_num: int):
+                """Write analysis data for the current step."""
+                if solvation_writer and water_indices:
                     water_pos = pos_nm[water_indices]
-                    nonwater_pos = pos_nm[nonwater_indices] if nonwater_indices else np.zeros((0, 3))
-                    dissolved = count_dissolved_metformin_explicit(
-                        met_pos,
-                        pos_nm,
-                        nonwater_pos,
-                        water_pos,
-                        centroid,
-                        tablet_radius,
-                        radial_margin_nm,
-                        contact_cutoff_nm,
-                        water_shell_nm,
-                        min_water_neighbors=1,
-                    )
-                else:
-                    dissolved = count_dissolved_metformin(
-                        met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
-                    )
-                frac = (dissolved / len(met_indices)) if met_indices else 0.0
-                writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
+                    solvation_stats = analyze_solvation_shells(met_pos, water_pos, solvation_cutoff_nm)
+                    solvation_writer.writerow([
+                        f"{time_ps:.3f}",
+                        f"{solvation_stats['mean_solvation_number']:.4f}",
+                        f"{solvation_stats['std_solvation_number']:.4f}",
+                        f"{solvation_stats['min_solvation_number']:.1f}",
+                        f"{solvation_stats['max_solvation_number']:.1f}",
+                    ])
+                
+                # Concentration profile
+                bin_centers, concentrations = calculate_radial_concentration(
+                    met_pos, centroid, box_nm, concentration_bins
+                )
+                conc_row = [f"{time_ps:.3f}"] + [f"{c:.6f}" for c in concentrations]
+                concentration_writer.writerow(conc_row)
+                
+                # Water infiltration
+                if penetration_writer and water_indices:
+                    water_pos = pos_nm[water_indices]
+                    infiltration_stats = track_water_infiltration(water_pos, centroid, tablet_radius)
+                    penetration_writer.writerow([
+                        f"{time_ps:.3f}",
+                        f"{infiltration_stats['water_inside_tablet']:.1f}",
+                        f"{infiltration_stats['max_penetration_depth_nm']:.4f}",
+                        f"{infiltration_stats['fraction_infiltrated']:.6f}",
+                    ])
+            
+            write_analysis_data(0)
+
+            # Dynamics
+            step_iter = range(1, steps + 1)
+            if tqdm is not None:
+                step_iter = tqdm(step_iter, total=steps, desc="Simulating", unit="step")
+            for step in step_iter:
+                integrator.step(1)
+                time_ps += dt_ps
+
+                if step % report_interval_steps == 0 or step == steps:
+                    state = context.getState(getPositions=True)
+                    pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                    # Compute centroid/radius from non-water positions
+                    if nonwater_indices:
+                        pos_nonwater = pos_nm[nonwater_indices]
+                    else:
+                        pos_nonwater = pos_nm
+                    centroid = compute_centroid(pos_nonwater) if pos_nonwater.size else np.array([
+                        0.5 * box_nm, 0.5 * box_nm, 0.5 * box_nm
+                    ])
+                    tablet_radius = compute_tablet_radius_nm(pos_nonwater, centroid) if pos_nonwater.size else 0.5
+                    met_pos = pos_nm[met_indices] if met_indices else np.zeros((0, 3))
+                    if water_indices:
+                        water_pos = pos_nm[water_indices]
+                        nonwater_pos = pos_nm[nonwater_indices] if nonwater_indices else np.zeros((0, 3))
+                        dissolved = count_dissolved_metformin_explicit(
+                            met_pos,
+                            pos_nm,
+                            nonwater_pos,
+                            water_pos,
+                            centroid,
+                            tablet_radius,
+                            radial_margin_nm,
+                            contact_cutoff_nm,
+                            water_shell_nm,
+                            min_water_neighbors=1,
+                        )
+                    else:
+                        dissolved = count_dissolved_metformin(
+                            met_pos, pos_nm, centroid, tablet_radius, radial_margin_nm, contact_cutoff_nm
+                        )
+                    frac = (dissolved / len(met_indices)) if met_indices else 0.0
+                    writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
+                    
+                    # Write detailed analysis data at specified frequency
+                    if step % (report_interval_steps * output_frequency) == 0 or step == steps:
+                        write_analysis_data(step)
+    
+    except Exception as e:
+        print(f"Error during simulation: {e}")
+        raise
+    finally:
+        # Close analysis files
+        if solvation_file:
+            solvation_file.close()
+        if concentration_file:
+            concentration_file.close()
+        if penetration_file:
+            penetration_file.close()
 
     # Final structure output (exclude water beads, include all other ingredients)
     final_state = context.getState(getPositions=True)

@@ -1,0 +1,27 @@
+{
+  "temperature_K": 310,
+  "friction_per_ps": 1.0,
+  "timestep_fs": 5,
+  "simulation_time_ps": 1000,
+  "box_nm": 8.0,
+  "random_seed": 2025,
+  "formulation": {
+    "metformin": {"beads": 50},
+    "excipients": [
+      {"name": "microcrystalline_cellulose", "role": "filler", "beads": 30},
+      {"name": "povidone", "role": "binder", "beads": 20},
+      {"name": "magnesium_stearate", "role": "lubricant", "beads": 10}
+    ],
+    "water": {"beads": 1000}
+  },
+  "mixing_rules": {
+    "water_metformin": {"epsilon": 3.0, "sigma": 0.39},
+    "water_magnesium_stearate": {"epsilon": 0.3, "sigma": 0.47},
+    "water_povidone": {"epsilon": 2.2, "sigma": 0.43}
+  },
+  "analysis": {
+    "solvation_cutoff_nm": 0.6,
+    "concentration_bins": 10,
+    "output_frequency": 5
+  }
+}
