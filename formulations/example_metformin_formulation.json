@@ -1,0 +1,50 @@
+{
+  "temperature_K": 310,
+  "friction_per_ps": 1.0,
+  "timestep_fs": 5,
+  "simulation_time_ps": 200.0,
+  "box_nm": 12.0,
+  "random_seed": 2025,
+  "solution_ph": 6.8,
+  "ionic_strength_mM": 100.0,
+  "formulation": {
+    "metformin": {
+      "beads": 200,
+      "parameters": {
+        "epsilon_kj_mol": 1.10,
+        "sigma_nm": 0.47,
+        "mass_amu": 129.0,
+        "titration_sites": [
+          {"pka": 12.4, "type": "base", "charge_protonated": 1.0, "charge_deprotonated": 0.0},
+          {"pka": 2.8,  "type": "acid", "charge_protonated": 0.0, "charge_deprotonated": -1.0}
+        ],
+        "solubility_ph_curve": {
+          "1.0": 0.2,
+          "3.0": 0.4,
+          "5.0": 0.6,
+          "6.5": 0.8,
+          "7.5": 1.0
+        }
+      }
+    },
+    "excipients": [
+      {
+        "name": "microcrystalline_cellulose",
+        "role": "filler",
+        "beads": 200
+      },
+      {
+        "name": "povidone",
+        "role": "binder",
+        "beads": 120
+      },
+      {
+        "name": "magnesium_stearate",
+        "role": "lubricant",
+        "beads": 50
+      }
+    ]
+  }
+}
+
+

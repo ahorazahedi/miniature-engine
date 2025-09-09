@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ForceField>
+    <Info>
+        <Source>Combined force field for pharmaceutical simulation</Source>
+    </Info>
+    
+    <AtomTypes>
+        <!-- Combined atom types from all molecules -->
+    </AtomTypes>
+    
+    <Residues>
+        <!-- From metformin -->
+    </Residues>
+    
+    <!-- Force field parameters would be combined here -->
+    
+</ForceField>

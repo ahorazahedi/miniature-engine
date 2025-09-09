@@ -1,0 +1,42 @@
+# Core OpenMM and molecular simulation dependencies
+openmm>=8.0.0
+mdtraj>=1.9.0
+numpy>=1.20.0
+
+# Molecular manipulation and force field generation
+rdkit>=2023.3.0
+openff-toolkit>=0.14.0
+pubchempy>=1.0.4
+
+# Optional but recommended for better performance
+openeye-toolkits  # Commercial license required
+
+# Web requests for PubChem API
+requests>=2.25.0
+
+# Additional scientific computing
+scipy>=1.7.0
+matplotlib>=3.5.0
+
+# For GAFF parameter generation (requires separate AmberTools installation)
+# Install AmberTools with: conda install -c conda-forge ambertools
+
+# Installation instructions:
+# 1. Create conda environment:
+#    conda create -n metformin_sim python=3.9
+#    conda activate metformin_sim
+#
+# 2. Install OpenMM:
+#    conda install -c conda-forge openmm
+#
+# 3. Install RDKit:
+#    conda install -c conda-forge rdkit
+#
+# 4. Install OpenFF:
+#    pip install openff-toolkit
+#
+# 5. Install remaining packages:
+#    pip install -r requirements.txt
+#
+# 6. Optional - Install AmberTools for GAFF parameters:
+#    conda install -c conda-forge ambertools
