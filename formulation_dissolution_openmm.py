@@ -67,6 +67,24 @@ Config JSON schema (minimal):
     "min_bead_mass_fraction": 0.05,
     "concentration_shell_nm": 1.0,
     "apply_to_components": ["metformin"]
+  },
+  "ph_effects": {
+    "enable_ph_effects": true,
+    "temperature_k": 310,
+    "use_davies_equation": true,
+    "gi_phases": [
+      {"name": "gastric", "ph": 1.5, "ionic_strength_m": 0.1, "duration_ps": 3600000, "buffer_capacity": 0.01},
+      {"name": "duodenal", "ph": 6.0, "ionic_strength_m": 0.15, "duration_ps": 1800000, "buffer_capacity": 0.02},
+      {"name": "intestinal", "ph": 7.4, "ionic_strength_m": 0.12, "duration_ps": 10800000, "buffer_capacity": 0.015}
+    ],
+    "species_data": {
+      "metformin": {
+        "pka_values": [2.8, 11.5],
+        "base_charge": 0,
+        "solubility_factors": [1.0, 15.0, 100.0],
+        "rate_factors": [0.5, 2.0, 8.0]
+      }
+    }
   }
 }
 
@@ -142,6 +160,36 @@ class DissolutionParams:
     min_bead_mass_fraction: float  # Remove bead when mass falls below this fraction
     concentration_shell_nm: float  # Radius to calculate local concentration
     apply_to_components: List[str]  # Which components can dissolve (e.g., ["metformin"])
+
+
+@dataclass
+class IonicSpecies:
+    """Properties of an ionic species at different pH values."""
+    name: str
+    pka_values: List[float]  # pKa values for polyprotic species
+    base_charge: int  # Charge at fully deprotonated state
+    solubility_factors: List[float]  # Solubility multiplier for each ionization state
+    rate_factors: List[float]  # Rate constant multiplier for each ionization state
+
+
+@dataclass
+class GIPhase:
+    """Gastrointestinal tract phase parameters."""
+    name: str
+    ph: float
+    ionic_strength_m: float  # Ionic strength in molarity
+    duration_ps: float  # Duration of this phase
+    buffer_capacity: float  # Resistance to pH change
+
+
+@dataclass
+class PHParams:
+    """pH and ionic strength parameters for dissolution."""
+    enable_ph_effects: bool
+    gi_phases: List[GIPhase]  # Sequential GI phases (stomach → intestine)
+    species_data: Dict[str, IonicSpecies]  # Component-specific ionization data
+    temperature_k: float  # For activity coefficient calculations
+    use_davies_equation: bool  # Use Davies equation for activity coefficients
 
 
 # ------------------------------ Defaults / Library ---------------------------
@@ -508,6 +556,169 @@ def calculate_local_concentration(
     shell_volume_nm3 = (4.0/3.0) * np.pi * shell_radius_nm**3
     
     return dissolved_in_shell / shell_volume_nm3
+
+
+def get_current_gi_phase(time_ps: float, gi_phases: List[GIPhase]) -> Tuple[GIPhase, float]:
+    """Get current GI phase and progress within phase based on simulation time.
+    
+    Args:
+        time_ps: Current simulation time
+        gi_phases: List of sequential GI phases
+    
+    Returns:
+        Tuple of (current_phase, phase_progress_fraction)
+    """
+    if not gi_phases:
+        # Default gastric phase if none specified
+        default_phase = GIPhase(name="gastric", ph=1.5, ionic_strength_m=0.1, 
+                               duration_ps=float('inf'), buffer_capacity=0.01)
+        return default_phase, 0.0
+    
+    cumulative_time = 0.0
+    for phase in gi_phases:
+        if time_ps <= cumulative_time + phase.duration_ps:
+            progress = (time_ps - cumulative_time) / phase.duration_ps
+            return phase, min(1.0, max(0.0, progress))
+        cumulative_time += phase.duration_ps
+    
+    # Return last phase if time exceeds all phases
+    return gi_phases[-1], 1.0
+
+
+def calculate_ionization_fractions(ph: float, pka_values: List[float], base_charge: int) -> List[float]:
+    """Calculate ionization state fractions using Henderson-Hasselbalch equation.
+    
+    For polyprotic species with multiple pKa values.
+    
+    Args:
+        ph: Current pH
+        pka_values: List of pKa values (sorted from lowest to highest)
+        base_charge: Charge at fully deprotonated state
+        
+    Returns:
+        List of fractions for each ionization state [fully protonated → fully deprotonated]
+    """
+    if not pka_values:
+        # Neutral species
+        return [1.0]
+    
+    n_states = len(pka_values) + 1  # Number of ionization states
+    alpha = np.zeros(n_states)
+    
+    # Calculate alpha values using Henderson-Hasselbalch
+    h_concentration = 10**(-ph)
+    
+    # Calculate denominators for each state
+    denominator = 0.0
+    for i in range(n_states):
+        term = 1.0
+        for j in range(i):
+            term *= (h_concentration / (10**(-pka_values[j])))
+        denominator += term
+    
+    # Calculate fractions
+    for i in range(n_states):
+        numerator = 1.0
+        for j in range(i):
+            numerator *= (h_concentration / (10**(-pka_values[j])))
+        alpha[i] = numerator / denominator
+    
+    return alpha.tolist()
+
+
+def calculate_average_charge(ionization_fractions: List[float], base_charge: int, pka_values: List[float]) -> float:
+    """Calculate average charge based on ionization state fractions.
+    
+    Args:
+        ionization_fractions: Fractions for each ionization state
+        base_charge: Charge at fully deprotonated state
+        pka_values: List of pKa values
+        
+    Returns:
+        Average charge of the species
+    """
+    if not ionization_fractions:
+        return 0.0
+    
+    avg_charge = 0.0
+    for i, fraction in enumerate(ionization_fractions):
+        # Each protonation increases charge by +1
+        protons_added = len(pka_values) - i
+        charge = base_charge + protons_added
+        avg_charge += fraction * charge
+    
+    return avg_charge
+
+
+def calculate_davies_activity_coefficient(charge: float, ionic_strength: float) -> float:
+    """Calculate activity coefficient using Davies equation.
+    
+    γ = 10^(-A|z²|[(√I)/(1+√I) - 0.3I])
+    where A = 0.5085 at 25°C in water
+    
+    Args:
+        charge: Ionic charge
+        ionic_strength: Ionic strength in molarity
+        
+    Returns:
+        Activity coefficient
+    """
+    if abs(charge) < 0.1:  # Neutral species
+        return 1.0
+    
+    A = 0.5085  # Davies constant at 25°C
+    sqrt_I = np.sqrt(ionic_strength)
+    
+    exponent = -A * (charge**2) * (sqrt_I / (1 + sqrt_I) - 0.3 * ionic_strength)
+    return 10**exponent
+
+
+def get_ph_dependent_dissolution_params(
+    base_params: DissolutionParams,
+    species_name: str,
+    ph: float,
+    ionic_strength: float,
+    species_data: Dict[str, IonicSpecies],
+) -> DissolutionParams:
+    """Calculate pH-dependent dissolution parameters.
+    
+    Args:
+        base_params: Base dissolution parameters
+        species_name: Name of the dissolving species
+        ph: Current pH
+        ionic_strength: Current ionic strength
+        species_data: Ionic species database
+        
+    Returns:
+        Modified dissolution parameters for current conditions
+    """
+    if species_name not in species_data:
+        # No pH data available, return base parameters
+        return base_params
+    
+    species = species_data[species_name]
+    
+    # Calculate ionization fractions
+    fractions = calculate_ionization_fractions(ph, species.pka_values, species.base_charge)
+    
+    # Calculate weighted solubility and rate factors
+    solubility_factor = sum(f * sf for f, sf in zip(fractions, species.solubility_factors))
+    rate_factor = sum(f * rf for f, rf in zip(fractions, species.rate_factors))
+    
+    # Calculate average charge for activity coefficient
+    avg_charge = calculate_average_charge(fractions, species.base_charge, species.pka_values)
+    activity_coeff = calculate_davies_activity_coefficient(avg_charge, ionic_strength)
+    
+    # Apply pH-dependent modifications
+    modified_params = DissolutionParams(
+        rate_constant_nm_per_ps=base_params.rate_constant_nm_per_ps * rate_factor * activity_coeff,
+        saturation_concentration_beads_per_nm3=base_params.saturation_concentration_beads_per_nm3 * solubility_factor * activity_coeff,
+        min_bead_mass_fraction=base_params.min_bead_mass_fraction,
+        concentration_shell_nm=base_params.concentration_shell_nm,
+        apply_to_components=base_params.apply_to_components,
+    )
+    
+    return modified_params
 
 
 def apply_noyes_whitney_dissolution(
@@ -975,12 +1186,49 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                         is_dissolved=False  # Non-dissolving components never dissolve
                     ))
     
+    # pH effects configuration
+    ph_cfg = cfg.get("ph_effects", {})
+    enable_ph_effects = bool(ph_cfg.get("enable_ph_effects", False))
+    ph_params = None
+    
+    if enable_ph_effects:
+        # Parse GI phases
+        gi_phases = []
+        for phase_cfg in ph_cfg.get("gi_phases", []):
+            gi_phases.append(GIPhase(
+                name=str(phase_cfg.get("name", "unknown")),
+                ph=float(phase_cfg.get("ph", 7.0)),
+                ionic_strength_m=float(phase_cfg.get("ionic_strength_m", 0.1)),
+                duration_ps=float(phase_cfg.get("duration_ps", 3600000)),
+                buffer_capacity=float(phase_cfg.get("buffer_capacity", 0.01))
+            ))
+        
+        # Parse species data
+        species_data = {}
+        for species_name, species_cfg in ph_cfg.get("species_data", {}).items():
+            species_data[species_name] = IonicSpecies(
+                name=species_name,
+                pka_values=species_cfg.get("pka_values", []),
+                base_charge=int(species_cfg.get("base_charge", 0)),
+                solubility_factors=species_cfg.get("solubility_factors", [1.0]),
+                rate_factors=species_cfg.get("rate_factors", [1.0])
+            )
+        
+        ph_params = PHParams(
+            enable_ph_effects=True,
+            gi_phases=gi_phases,
+            species_data=species_data,
+            temperature_k=float(ph_cfg.get("temperature_k", 310.0)),
+            use_davies_equation=bool(ph_cfg.get("use_davies_equation", True))
+        )
+    
     # Output setup
     metrics_path = f"{output_prefix}_metrics.csv"
     solvation_path = f"{output_prefix}_solvation.csv"
     concentration_path = f"{output_prefix}_concentration.csv"
     penetration_path = f"{output_prefix}_penetration.csv"
     dissolution_path = f"{output_prefix}_dissolution.csv"
+    ph_path = f"{output_prefix}_ph_effects.csv"
     pdb_path = f"{output_prefix}_final_positions.pdb"
     
     # Create analysis output files if water is present
@@ -988,6 +1236,7 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
     concentration_file = open(concentration_path, "w", newline="")
     penetration_file = open(penetration_path, "w", newline="") if water_indices else None
     dissolution_file = open(dissolution_path, "w", newline="") if enable_noyes_whitney else None
+    ph_file = open(ph_path, "w", newline="") if enable_ph_effects else None
     
     try:
         with open(metrics_path, "w", newline="") as csvfile:
@@ -999,6 +1248,7 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
             concentration_writer = None
             penetration_writer = None
             dissolution_writer = None
+            ph_writer = None
             
             if solvation_file:
                 solvation_writer = csv.writer(solvation_file)
@@ -1022,6 +1272,11 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                 dissolution_writer = csv.writer(dissolution_file)
                 dissolution_writer.writerow(["time_ps", "total_dissolved_mass_amu", "mean_mass_fraction_remaining", 
                                            "num_fully_dissolved", "dissolution_rate_amu_per_ps"])
+            
+            if ph_file:
+                ph_writer = csv.writer(ph_file)
+                ph_writer.writerow(["time_ps", "gi_phase", "ph", "ionic_strength_m", "metformin_charge", 
+                                   "solubility_factor", "rate_factor", "activity_coefficient"])
 
             # Heuristics for dissolution classification
             radial_margin_nm = 1.5
@@ -1106,6 +1361,37 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                         num_fully_dissolved,
                         f"{dissolution_rate:.6f}",
                     ])
+                
+                # pH effects output
+                if ph_writer and enable_ph_effects:
+                    current_phase, phase_progress = get_current_gi_phase(time_ps, ph_params.gi_phases)
+                    
+                    # Calculate metformin ionization if present
+                    if "metformin" in ph_params.species_data:
+                        metformin_species = ph_params.species_data["metformin"]
+                        fractions = calculate_ionization_fractions(current_phase.ph, metformin_species.pka_values, metformin_species.base_charge)
+                        avg_charge = calculate_average_charge(fractions, metformin_species.base_charge, metformin_species.pka_values)
+                        
+                        # Calculate factors
+                        solubility_factor = sum(f * sf for f, sf in zip(fractions, metformin_species.solubility_factors))
+                        rate_factor = sum(f * rf for f, rf in zip(fractions, metformin_species.rate_factors))
+                        activity_coeff = calculate_davies_activity_coefficient(avg_charge, current_phase.ionic_strength_m)
+                    else:
+                        avg_charge = 0.0
+                        solubility_factor = 1.0
+                        rate_factor = 1.0
+                        activity_coeff = 1.0
+                    
+                    ph_writer.writerow([
+                        f"{time_ps:.3f}",
+                        current_phase.name,
+                        f"{current_phase.ph:.2f}",
+                        f"{current_phase.ionic_strength_m:.4f}",
+                        f"{avg_charge:.4f}",
+                        f"{solubility_factor:.6f}",
+                        f"{rate_factor:.6f}",
+                        f"{activity_coeff:.6f}",
+                    ])
             
             write_analysis_data(0)
 
@@ -1122,12 +1408,24 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                     state = context.getState(getPositions=True)
                     current_pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
                     
-                    # Apply dissolution kinetics
+                    # Get current pH-dependent dissolution parameters
+                    current_dissolution_params = dissolution_params
+                    if enable_ph_effects and ph_params:
+                        current_phase, _ = get_current_gi_phase(time_ps, ph_params.gi_phases)
+                        current_dissolution_params = get_ph_dependent_dissolution_params(
+                            dissolution_params,
+                            "metformin",  # Primary dissolving species
+                            current_phase.ph,
+                            current_phase.ionic_strength_m,
+                            ph_params.species_data
+                        )
+                    
+                    # Apply dissolution kinetics with pH-dependent parameters
                     dissolving_beads, indices_to_remove = apply_noyes_whitney_dissolution(
                         dissolving_beads,
                         current_pos_nm,
                         dissolved_positions,
-                        dissolution_params,
+                        current_dissolution_params,
                         dt_ps
                     )
                     
@@ -1193,6 +1491,8 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
             penetration_file.close()
         if dissolution_file:
             dissolution_file.close()
+        if ph_file:
+            ph_file.close()
 
     # Final structure output (exclude water beads, include all other ingredients)
     final_state = context.getState(getPositions=True)

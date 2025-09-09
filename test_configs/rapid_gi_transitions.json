@@ -1,0 +1,52 @@
+{
+  "temperature_K": 310,
+  "friction_per_ps": 1.0,
+  "timestep_fs": 5,
+  "simulation_time_ps": 20,
+  "box_nm": 8.0,
+  "random_seed": 2025,
+  "formulation": {
+    "metformin": {"beads": 30},
+    "excipients": [
+      {"name": "microcrystalline_cellulose", "role": "filler", "beads": 20},
+      {"name": "povidone", "role": "binder", "beads": 12}
+    ],
+    "water": {"beads": 600}
+  },
+  "mixing_rules": {
+    "water_metformin": {"epsilon": 3.0, "sigma": 0.39},
+    "water_povidone": {"epsilon": 2.2, "sigma": 0.43}
+  },
+  "analysis": {
+    "solvation_cutoff_nm": 0.6,
+    "concentration_bins": 8,
+    "output_frequency": 2
+  },
+  "dissolution_physics": {
+    "enable_noyes_whitney": true,
+    "rate_constant_nm_per_ps": 0.004,
+    "saturation_concentration_beads_per_nm3": 0.06,
+    "min_bead_mass_fraction": 0.1,
+    "concentration_shell_nm": 0.8,
+    "apply_to_components": ["metformin"]
+  },
+  "ph_effects": {
+    "enable_ph_effects": true,
+    "temperature_k": 310,
+    "use_davies_equation": true,
+    "gi_phases": [
+      {"name": "gastric", "ph": 1.5, "ionic_strength_m": 0.1, "duration_ps": 5, "buffer_capacity": 0.01},
+      {"name": "duodenal", "ph": 4.5, "ionic_strength_m": 0.15, "duration_ps": 5, "buffer_capacity": 0.02},
+      {"name": "jejunal", "ph": 6.8, "ionic_strength_m": 0.12, "duration_ps": 5, "buffer_capacity": 0.015},
+      {"name": "ileal", "ph": 7.4, "ionic_strength_m": 0.11, "duration_ps": 5, "buffer_capacity": 0.012}
+    ],
+    "species_data": {
+      "metformin": {
+        "pka_values": [2.8, 11.5],
+        "base_charge": 0,
+        "solubility_factors": [1.0, 25.0, 120.0],
+        "rate_factors": [0.4, 3.0, 12.0]
+      }
+    }
+  }
+}
