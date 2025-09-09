@@ -68,6 +68,10 @@ import numpy as np
 
 import openmm
 from openmm import unit
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None  # fallback if tqdm is unavailable
 
 
 # ------------------------------ Data Structures ------------------------------
@@ -562,7 +566,10 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
         writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
 
         # Dynamics
-        for step in range(1, steps + 1):
+        step_iter = range(1, steps + 1)
+        if tqdm is not None:
+            step_iter = tqdm(step_iter, total=steps, desc="Simulating", unit="step")
+        for step in step_iter:
             integrator.step(1)
             time_ps += dt_ps
 
@@ -601,10 +608,18 @@ def run_simulation(config_path: str, output_prefix: str, override_steps: int = N
                 frac = (dissolved / len(met_indices)) if met_indices else 0.0
                 writer.writerow([f"{time_ps:.3f}", dissolved, f"{frac:.6f}", f"{tablet_radius:.4f}"])
 
-    # Final structure output
+    # Final structure output (exclude water beads, include all other ingredients)
     final_state = context.getState(getPositions=True)
     final_positions_nm = final_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    write_cg_pdb(pdb_path, final_positions_nm, labels, box_nm)
+    nonwater_mask_list = [lab != "water" for lab in labels]
+    if any(nonwater_mask_list):
+        nonwater_mask = np.array(nonwater_mask_list, dtype=bool)
+        filtered_positions_nm = final_positions_nm[nonwater_mask]
+        filtered_labels = [lab for lab in labels if lab != "water"]
+    else:
+        filtered_positions_nm = final_positions_nm
+        filtered_labels = labels
+    write_cg_pdb(pdb_path, filtered_positions_nm, filtered_labels, box_nm)
 
     # Clean up
     del context
